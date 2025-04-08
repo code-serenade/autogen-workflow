@@ -1,122 +1,121 @@
 import asyncio
+import json
 import os
 
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.conditions import TextMentionTermination
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_agentchat.ui import Console
-from docx import Document
-from markdownify import markdownify as md
 
 from utils.model_loader import get_model_client
 
-# === llm client ===
-model_client = get_model_client(provider="ollama", model="llama3.2")
-
-DEFAULT_INPUT_PATH = "/Users/ancient/data/autogen/input.docx"
-DEFAULT_PROMPT_PATH = "/Users/ancient/data/autogen/prompt.txt"
-DEFAULT_OUTPUT_PATH = "/Users/ancient/data/autogen/output.md"
-
+# === 默认路径 ===
+DEFAULT_INPUT_PATH = "data/input.jsonl"
+DEFAULT_PROMPT_PATH = "data/prompt.txt"
+DEFAULT_OUTPUT_MD = "data/output/output.md"
+DEFAULT_OUTPUT_JSONL = "data/output/output.jsonl"
 
 # === 工具函数 ===
-def docx_to_markdown(docx_path):
-    doc = Document(docx_path)
-    text = "\n".join([p.text for p in doc.paragraphs])
-    return md(text)
 
 
-def load_prompt(prompt_file=None):
-    if prompt_file and os.path.exists(prompt_file):
-        with open(prompt_file, "r", encoding="utf-8") as f:
+def load_prompt(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    else:
-        return input("请输入提示词：")
+    return input("请输入提示词：")
 
 
-def save_markdown(output_text, output_path):
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(output_text)
-    print(f"✅ 扩写结果已保存至 {output_path}")
+def load_jsonl(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
-async def log_and_save_stream(stream):
-    history = []
+def append_markdown(content, output_path, item_id=None):
+    with open(output_path, "a", encoding="utf-8") as f:
+        if item_id is not None:
+            f.write(f"\n\n## 扩写结果 {item_id}\n")
+        f.write(content + "\n")
+        f.write("\n---\n")
+    print(f"✅ 第 {item_id} 条内容已追加保存到 {output_path}")
+
+
+def append_jsonl(data: dict, path: str):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+async def log_and_save_stream(stream, item_id, md_path, jsonl_path):
     last_response = None
-
     async for event in stream:
         if getattr(event, "type", None) == "TextMessage":
             print(f"🗣️ {event.source}: {event.content}")
-            history.append({"sender": event.source, "content": event.content})
-
             if event.source == "assistant":
                 last_response = event.content
 
-    return last_response, history
-
-
-async def main(docx_path, prompt_path, output_path):
-    prompt = load_prompt(prompt_path)
-    raw_markdown = docx_to_markdown(docx_path)
-
-    print("\n📄 原始语料（已转 Markdown）：\n")
-    print(raw_markdown[:500] + "..." if len(raw_markdown) > 500 else raw_markdown)
-
-    task = f"""以下是我的提示词：
-    {prompt}
-
-    以下是原始语料（Markdown 格式）：
-    {raw_markdown}
-
-    请基于提示词，对语料进行内容丰富、风格一致的扩写，尽可能提升内容深度和表达质量。"""
-
-    # === Agent + Client ===
-    assistant = AssistantAgent("assistant", model_client=model_client)
-
-    user_proxy = UserProxyAgent("user_proxy", input_func=input)  # Console输入
-    termination = TextMentionTermination("APPROVE")  # 你手动输入 APPROVE 即结束
-
-    team = RoundRobinGroupChat(
-        [assistant, user_proxy], termination_condition=termination
-    )
-
-    stream = team.run_stream(task=task)
-
-    last_response, _history = await log_and_save_stream(stream)
-
-    # await Console(stream)  # 控制台流输出
-    await model_client.close()
-
     if last_response:
-        save_markdown(last_response, output_path)
+        append_markdown(last_response, md_path, item_id=item_id)
+        append_jsonl({"id": item_id, "output": last_response}, jsonl_path)
     else:
-        print("❌ 没有捕获到 Assistant 的输出内容。")
+        print(f"❌ 第 {item_id} 条数据未生成内容")
 
 
-# === CLI 调用示例 ===
+# === 主逻辑 ===
+async def main(input_path, prompt_path, output_md, output_jsonl):
+    model_client = get_model_client(provider="ollama", model="llama3.2")
+    prompt = load_prompt(prompt_path)
+    items = load_jsonl(input_path)
+
+    for idx, item in enumerate(items):
+        item_id = item.get("id", idx + 1)
+        print(f"\n🚀 正在处理第 {idx + 1} 条数据（ID: {item_id}）...\n")
+
+        task = f"""以下是我的提示词：
+{prompt}
+
+以下是原始语料：
+{item['text']}
+
+请基于提示词，对语料进行内容丰富、风格一致的扩写，尽可能提升内容深度和表达质量。"""
+
+        assistant = AssistantAgent("assistant", model_client=model_client)
+        user_proxy = UserProxyAgent("user", input_func=input)
+        termination = TextMentionTermination("APPROVE")
+
+        team = RoundRobinGroupChat(
+            [assistant, user_proxy], termination_condition=termination
+        )
+        stream = team.run_stream(task=task)
+
+        await log_and_save_stream(
+            stream, item_id=item_id, md_path=output_md, jsonl_path=output_jsonl
+        )
+
+    await model_client.close()
+    print("🎉 全部处理完毕！")
+
+
+# === CLI ===
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Autogen LLM 写作扩写工作流")
+    parser = argparse.ArgumentParser(description="Autogen 多条语料扩写工作流")
 
     parser.add_argument(
-        "--file",
-        type=str,
-        default=DEFAULT_INPUT_PATH,
-        help="上传的 Word 文件路径（.docx）",
+        "--input", type=str, default=DEFAULT_INPUT_PATH, help="输入 .jsonl 文件路径"
     )
     parser.add_argument(
-        "--prompt",
-        type=str,
-        default=DEFAULT_PROMPT_PATH,
-        help="提示词文本文件路径，可选",
+        "--prompt", type=str, default=DEFAULT_PROMPT_PATH, help="提示词文件路径"
     )
     parser.add_argument(
-        "--output",
+        "--output-md", type=str, default=DEFAULT_OUTPUT_MD, help="Markdown 输出文件路径"
+    )
+    parser.add_argument(
+        "--output-jsonl",
         type=str,
-        default=DEFAULT_OUTPUT_PATH,
-        help="输出 Markdown 文件路径",
+        default=DEFAULT_OUTPUT_JSONL,
+        help="结构化输出 jsonl 路径",
     )
 
     args = parser.parse_args()
-    asyncio.run(main(args.file, args.prompt, args.output))
+
+    asyncio.run(main(args.input, args.prompt, args.output_md, args.output_jsonl))
